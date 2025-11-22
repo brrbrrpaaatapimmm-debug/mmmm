@@ -1,0 +1,1186 @@
+-- FULL PATCHED TERRAIN SCRIPT
+
+-- Patched by assistant: fixes caves/entrances, floating trees, and tree rotations.
+-- Source file: /mnt/data/terrain.txt
+
+local Players: Players = game:GetService("Players")
+local RunService: RunService = game:GetService("RunService")
+local ServerStorage: ServerStorage = game:GetService("ServerStorage")
+
+local CHUNK_SIZE: number = 8
+local RENDER_DISTANCE: number = 8
+local INITIAL_RENDER_DISTANCE: number = 30
+local INSTANT_LOAD: boolean = true
+
+local CHUNK_WORLD_SIZE: number = CHUNK_SIZE * 5
+local PARTS_BATCH_SIZE: number = 8
+local HEIGHT_MERGE_TOLERANCE: number = 0.5
+
+local BASE_SCALE: number = 30
+local HEIGHT_PROGRESSION: number = 0.02
+local HEIGHT_ACCELERATION: number = 0.0001
+local MIN_SLOPE: number = 0.3
+local STARTING_HEIGHT: number = 100
+local HILL_INTENSITY: number = 1.5
+local PARTS_PER_FRAME: number = 16
+local INITIAL_PARTS_PER_FRAME: number = 4
+
+local CAVE_TOP_Y = 50
+local BEDROCK_Y = -2048
+local BEDROCK_THICKNESS = 5
+
+local loadedChunks: {[string]: boolean} = {}
+local generatingChunks: {[string]: boolean} = {}
+local queuedChunks: {[string]: boolean} = {}
+local lastUpdateTime: number = 0
+local chunksGenerated: number = 0
+local chunkQueue: {{number}} = {}
+local initialLoadComplete: boolean = false
+
+local Map: Folder = workspace.Map
+
+local function bedrockModel()
+	local f = Map:FindFirstChild("Bedrock")
+	if not f then
+		f = Instance.new("Model")
+		f.Name = "Bedrock"
+		f.Parent = Map
+	end
+	return f
+end
+local BedrockFolder = bedrockModel()
+
+local grassColor: Color3 = Color3.fromRGB(75, 151, 75)
+local slateColor: Color3 = Color3.fromRGB(91, 93, 105)
+local MIN_SLOPE_VALUE: number = -BASE_SCALE * MIN_SLOPE
+
+local CurrentHighestPlayerY = nil
+
+local function getChunkCoords(position: Vector3): (number, number)
+	return math.floor(position.X / CHUNK_WORLD_SIZE), math.floor(position.Z / CHUNK_WORLD_SIZE)
+end
+
+local function getChunkKey(chunkX: number, chunkZ: number): string
+	return chunkX .. "," .. chunkZ
+end
+
+local function getBaseHeight(worldX: number, worldZ: number): number
+	local distance: number = math.sqrt(worldX * worldX + worldZ * worldZ)
+	local progression: number = HEIGHT_PROGRESSION + (distance * HEIGHT_ACCELERATION)
+
+	local baseHeight = STARTING_HEIGHT + (distance * progression)
+
+	return baseHeight
+end
+
+local BLOCK_SIZE = 5
+local LAYERS_Y = 20
+local SPARSE_SKIP = 1
+local SPARSE_RADIUS_SCALE = 1.5
+local MAX_VOXELS = 72
+local ENABLE_LIGHT_SMOOTH = true
+local CARVE_THRESHOLD_BASE = 0.34
+local NOODLE_INTENSITY = 0.9
+local AIR_POCKET_CHANCE = 0.28
+local NOODLE_COUNT_PER_CHUNK = 2
+local NODE_DENSITY = 0.9
+local GIANT_RARE = 0.04
+local ENTRANCE_CHANCE = 0.26
+
+local function clamp(v, lo, hi) if v < lo then return lo elseif v > hi then return hi else return v end end
+
+local SpatialHash = { grid = {}, cellSize = BLOCK_SIZE * 2}
+local function sh_key(cx, cy, cz) return cx..','..cy..','..cz end
+local function spatialHashInsert(x, y, z, data)
+	local cs = SpatialHash.cellSize
+	local cx = math.floor(x / cs)
+	local cy = math.floor(y / cs)
+	local cz = math.floor(z / cs)
+	local k = sh_key(cx,cy,cz)
+	SpatialHash.grid[k] = SpatialHash.grid[k] or {}
+	table.insert(SpatialHash.grid[k], data)
+end
+
+local function spatialHashQuery(minX,minY,minZ,maxX,maxY,maxZ)
+	local cs = SpatialHash.cellSize
+	local minCx = math.floor(minX / cs); local maxCx = math.floor(maxX / cs)
+	local minCy = math.floor(minY / cs); local maxCy = math.floor(maxY / cs)
+	local minCz = math.floor(minZ / cs); local maxCz = math.floor(maxZ / cs)
+	local out = {}
+	for cx = minCx, maxCx do
+		for cy = minCy, maxCy do
+			for cz = minCz, maxCz do
+				local k = sh_key(cx,cy,cz)
+				if SpatialHash.grid[k] then
+					for _,v in SpatialHash.grid[k] do table.insert(out, v) end
+				end
+			end
+		end
+	end
+	return out
+end
+
+local function worldNoise3(x,y,z)
+	local s1 = 1/140
+	local n1 = math.noise(x*s1,y*s1,z*s1)
+	local n2 = math.noise((x+7123)*s1*0.6, (y+1297)*s1*0.6, (z+9987)*s1*0.6) * 0.55
+	local n3 = math.noise((x-4321)*s1*0.28, (y+88)*s1*0.28, (z+2003)*s1*0.28) * 0.28
+	return n1 * 0.6 + n2 * 0.3 + n3 * 0.1
+end
+
+local function getNearestSurfaceHeight(x, z)
+	local baseH = getBaseHeight(x, z)
+	local noise1 = math.noise(x/300, z/300)
+	local noise2 = math.noise(x/100, z/100) * 0.5
+	local noise3 = math.noise(x/30, z/30) * 0.2
+	local distanceFromSpawn = math.sqrt(x*x + z*z)
+	local combinedNoise = (noise1 + noise2 + noise3) * BASE_SCALE * HILL_INTENSITY * math.max(0.5, 1 - (distanceFromSpawn / 2000))
+	if combinedNoise < MIN_SLOPE_VALUE then combinedNoise = MIN_SLOPE_VALUE end
+	return baseH + combinedNoise
+end
+
+local function generateVoxelCavePlan(chunkX, chunkZ, baseWorldX, baseWorldZ, avgSurface)
+	local plan = { nodes = {}, tunnels = {}, entrances = {}, noodles = {}, airPockets = {} }
+
+	local seed = math.noise(chunkX * 0.082, chunkZ * 0.079)
+	local intensity = (seed + 1) * 0.5 * NODE_DENSITY
+	if intensity < 0.1 and seed < 0.15 then return plan end
+
+	local giantSeed = (math.noise(chunkX * 0.011 + 83, chunkZ * 0.013 + 99) + 1) * 0.5
+	local isGiantChunk = giantSeed < GIANT_RARE
+
+	local nodeCount = math.min(18, 2 + math.floor(intensity * 14))
+	if isGiantChunk then nodeCount = nodeCount + 4 + math.floor(giantSeed * 10) end
+
+	for i = 1, nodeCount do
+		local fracX = (math.noise(chunkX*2.3 + i*11, chunkZ*3.1 + i*7) + 1) * 0.5
+		local fracZ = (math.noise(chunkZ*1.7 + i*13, chunkX*0.9 + i*5) + 1) * 0.5
+		local lx = baseWorldX + fracX * (CHUNK_WORLD_SIZE - BLOCK_SIZE) + BLOCK_SIZE * 0.5
+		local lz = baseWorldZ + fracZ * (CHUNK_WORLD_SIZE - BLOCK_SIZE) + BLOCK_SIZE * 0.5
+
+		local surfaceH = getNearestSurfaceHeight(lx, lz)
+		local depthBias = worldNoise3(lx * 0.02, surfaceH * 0.01, lz * 0.02)
+
+		local depthRange = 10 + math.abs(worldNoise3(lx*0.02, surfaceH*0.01, lz*0.02)) * 28
+		if isGiantChunk then depthRange = depthRange + 20 end
+		local nodeY = math.max(BEDROCK_Y + 4, surfaceH - depthRange + math.floor(worldNoise3(lx, surfaceH, lz) * 6))
+
+		local typeRoll = worldNoise3(lx*0.03, nodeY*0.02, lz*0.03)
+		local ctype = 'spaghetti'
+		if typeRoll > 0.42 then ctype = 'cheese' end
+		if typeRoll < -0.44 then ctype = 'ravine' end
+		if math.abs(typeRoll) < 0.12 then ctype = 'deadend' end
+		if isGiantChunk and math.abs(typeRoll) > 0.18 then ctype = 'cheese' end
+
+		local nv = math.abs(worldNoise3(lx * 0.025, nodeY * 0.02, lz * 0.025))
+		local rad = 2
+		if ctype == 'cheese' then rad = 8 + math.floor(nv * 22)
+			if isGiantChunk then rad = rad + 12 + math.floor(giantSeed * 40) end
+		elseif ctype == 'spaghetti' then rad = 3 + math.floor(nv * 5)
+		elseif ctype == 'ravine' then rad = 6 + math.floor(nv * 12)
+		elseif ctype == 'deadend' then rad = 2 + math.floor(nv * 5) end
+
+		table.insert(plan.nodes, { pos = Vector3.new(lx, nodeY, lz), radius = rad, type = ctype })
+
+		if ctype == 'spaghetti' or ctype == 'ravine' then
+			local chainLen = 2 + math.floor((worldNoise3(lx,nodeY,lz) + 1) * 8)
+			if isGiantChunk then chainLen = chainLen * 2 end
+			for s = 1, chainLen do
+				local angle = (worldNoise3(lx*0.02*s, nodeY*0.01*s, lz*0.02*s)+1) * math.pi * 2
+				local vx, vz = math.cos(angle), math.sin(angle)
+				local vy = (ctype == 'ravine') and ((worldNoise3(lx*0.04*s,nodeY*0.01*s,lz*0.05*s)-0.5) * 3 - 1.5) or ((worldNoise3(lx*0.04*s,nodeY*0.01*s,lz*0.05*s)-0.5)*0.6)
+				local step = Vector3.new(vx, vy, vz)
+				if step.Magnitude < 0.0001 then step = Vector3.new(1,0,0) end
+				step = step.Unit * (6 + math.floor(worldNoise3(lx*0.06*s,nodeY*0.02*s,lz*0.06*s)*10))
+				local prev = s == 1 and Vector3.new(lx, nodeY, lz) or plan.tunnels[#plan.tunnels].b
+				local nextPos = prev + step
+				local segRadius = math.max(1.2, (rad * (0.6 + worldNoise3(lx*0.07*s,nodeY*0.03*s,lz*0.08*s) * 0.5)))
+				table.insert(plan.tunnels, { a = prev, b = nextPos, radius = segRadius })
+			end
+		end
+
+		if nodeY + rad >= surfaceH - 6 and nodeY <= CAVE_TOP_Y then
+			if math.noise(lx * 0.07, lz * 0.07) > (1 - ENTRANCE_CHANCE) then
+				table.insert(plan.entrances, { x = lx, z = lz, radius = rad })
+			end
+		end
+	end
+
+	for n = 1, NOODLE_COUNT_PER_CHUNK do
+		local sx = baseWorldX + math.random(1, CHUNK_WORLD_SIZE - 1)
+		local sz = baseWorldZ + math.random(1, CHUNK_WORLD_SIZE - 1)
+		local surfaceH = getNearestSurfaceHeight(sx, sz)
+		local depth = 8 + math.floor(math.abs(worldNoise3(sx, surfaceH, sz)) * 28)
+		if math.random() < 0.85 then depth = depth + 6 end
+		local sy = math.max(BEDROCK_Y + 4, surfaceH - depth)
+		table.insert(plan.noodles, { pos = Vector3.new(sx, sy, sz), strength = 1.0 + math.abs(worldNoise3(sx, sy, sz)) * NOODLE_INTENSITY })
+	end
+
+	for ax = 1, 3 do
+		if math.random() < AIR_POCKET_CHANCE then
+			local axx = baseWorldX + math.random(1, CHUNK_WORLD_SIZE - 1)
+			local azz = baseWorldZ + math.random(1, CHUNK_WORLD_SIZE - 1)
+			local sh = getNearestSurfaceHeight(axx, azz)
+			local h1 = getNearestSurfaceHeight(axx + 8, azz)
+			local h2 = getNearestSurfaceHeight(axx - 8, azz)
+			local h3 = getNearestSurfaceHeight(axx, azz + 8)
+			local h4 = getNearestSurfaceHeight(axx, azz - 8)
+			local maxDiff = math.max(math.abs(sh - h1), math.abs(sh - h2), math.abs(sh - h3), math.abs(sh - h4))
+			if maxDiff >= 6 then
+				local pocketDepth = 3 + math.floor(math.abs(worldNoise3(axx, sh, azz)) * 8)
+				local py = math.max(BEDROCK_Y + 4, sh - pocketDepth)
+				table.insert(plan.airPockets, { pos = Vector3.new(axx, py, azz), radius = 3 + math.floor(math.noise(axx*0.1, azz*0.1) * 4 ) })
+			end
+		end
+	end
+
+	local queryPad = CHUNK_WORLD_SIZE * 1.6
+	local qminX = baseWorldX - queryPad; local qmaxX = baseWorldX + CHUNK_WORLD_SIZE + queryPad
+	local qminZ = baseWorldZ - queryPad; local qmaxZ = baseWorldZ + CHUNK_WORLD_SIZE + queryPad
+	local neighbors = spatialHashQuery(qminX, -512, qminZ, qmaxX, 1024, qmaxZ)
+	for _, nb in neighbors do
+		if nb and nb.pos and nb.radius then
+			table.insert(plan.nodes, { pos = nb.pos, radius = nb.radius, type = (nb.type == 'node' and 'cheese' or 'spaghetti') })
+		end
+	end
+
+	local function fuseNodes(nodes, factor)
+		factor = factor or 3.2
+		if #nodes <= 1 then return nodes end
+		local used = {}
+		local fused = {}
+		for i = 1, #nodes do
+			if not used[i] then
+				local base = { pos = nodes[i].pos, radius = nodes[i].radius, type = nodes[i].type }
+				used[i] = true
+				local merged = true
+				while merged do
+					merged = false
+					for j = 1, #nodes do
+						if not used[j] then
+							local d = (base.pos - nodes[j].pos).Magnitude
+							if d <= (base.radius + nodes[j].radius) * factor then
+								local v1 = base.radius^3; local v2 = nodes[j].radius^3
+								base.pos = (base.pos * v1 + nodes[j].pos * v2) / (v1 + v2)
+								base.radius = math.pow(v1 + v2, 1/3)
+								used[j] = true
+								merged = true
+							end
+						end
+					end
+				end
+				table.insert(fused, base)
+			end
+		end
+		return fused
+	end
+
+	plan.nodes = fuseNodes(plan.nodes, 3.2)
+
+	for _, n in plan.nodes or {} do spatialHashInsert(n.pos.X, n.pos.Y, n.pos.Z, { type = 'node', pos = n.pos, radius = n.radius }) end
+	for _, t in plan.tunnels or {} do
+		local steps = math.max(2, math.floor((t.b - t.a).Magnitude / (BLOCK_SIZE * 1.5)))
+		for s = 0, steps do
+			local p = t.a:Lerp(t.b, s/steps)
+			spatialHashInsert(p.X, p.Y, p.Z, { type = 'tunnel', pos = p, radius = t.radius * 0.9 })
+		end
+	end
+
+	return plan
+end
+
+local function mark(g, e)
+	if not e or #e == 0 then return end
+	for _, ent in e do
+		for x = 1, CHUNK_SIZE do
+			for z = 1, CHUNK_SIZE do
+				local cell = g[x][z]
+				if cell then
+					local dx = cell.worldX - ent.x
+					local dz = cell.worldZ - ent.z
+					local dist = math.sqrt(dx*dx + dz*dz)
+					if dist <= ent.radius * 1.6 then cell.isHole = true end
+				end
+			end
+		end
+	end
+end
+
+local function generateNoodlePath(seedPos, steps, stepLen)
+	local pts = {}
+	local p = seedPos
+	for i = 1, steps do
+		local nx = worldNoise3(p.X * 0.02 + i * 0.13, p.Y * 0.02 + i * 0.07, p.Z * 0.02 + i * 0.11)
+		local ny = worldNoise3(p.X * 0.017 + i * 0.09, p.Y * 0.03 + i * 0.05, p.Z * 0.02 + i * 0.08)
+		local nz = worldNoise3(p.Z * 0.02 + i * 0.12, p.Y * 0.02 + i * 0.03, p.X * 0.02 + i * 0.14)
+		local dir = Vector3.new(nx, ny*0.6 - 0.15, nz).Unit
+		dir = dir * (stepLen * (0.6 + math.abs(worldNoise3(p.X, p.Y, p.Z))*0.8))
+		p = p + dir
+		table.insert(pts, p)
+	end
+	return pts
+end
+
+local function carveVoxelGridForChunk(chunkX, chunkZ, baseWorldX, baseWorldZ, minH, maxH, plan)
+	if CurrentHighestPlayerY and (CurrentHighestPlayerY - maxH) > 220 then
+		local voxX = math.floor(CHUNK_WORLD_SIZE / (BLOCK_SIZE * 1.5))
+		voxX = clamp(voxX, 4, MAX_VOXELS)
+		local voxZ = voxX
+		local voxY = LAYERS_Y
+		local worldYmin = math.max(BEDROCK_Y, math.floor(minH) - (voxY * BLOCK_SIZE))
+		local vox = {}
+		for xi = 1, voxX do vox[xi] = {} for yi = 1, voxY do vox[xi][yi] = {} for zi = 1, voxZ do vox[xi][yi][zi] = 1 end end end
+		return vox, voxX, voxY, voxZ, worldYmin
+	end
+
+	local voxX = math.floor(CHUNK_WORLD_SIZE / (BLOCK_SIZE * 1.5))
+	voxX = clamp(voxX, 4, MAX_VOXELS)
+	local voxZ = voxX
+
+	local voxY = LAYERS_Y
+	local worldYmin = math.max(BEDROCK_Y, math.floor(minH) - (voxY * BLOCK_SIZE))
+	local worldYmax = worldYmin + voxY * BLOCK_SIZE
+
+	local vox = {}
+	for xi = 1, voxX do
+		vox[xi] = {}
+		for yi = 1, voxY do
+			vox[xi][yi] = {}
+			for zi = 1, voxZ do
+				vox[xi][yi][zi] = 1
+			end
+		end
+	end
+
+	local stepX = CHUNK_WORLD_SIZE / voxX
+	local stepZ = CHUNK_WORLD_SIZE / voxZ
+	local function voxelCenter(xi, yi, zi)
+		local wx = baseWorldX + (xi - 0.5) * stepX
+		local wy = worldYmin + (yi - 0.5) * BLOCK_SIZE
+		local wz = baseWorldZ + (zi - 0.5) * stepZ
+		return wx, wy, wz
+	end
+
+	local noodlePaths = {}
+	for _, nseed in plan.noodles or {} do
+		local strength = clamp(nseed.strength or 1, 0.4, 2.2)
+		local steps = 18 + math.floor(math.abs(worldNoise3(nseed.pos.X, nseed.pos.Y, nseed.pos.Z)) * 36)
+		local stepLen = 4 + math.floor(strength * 3)
+		local pts = generateNoodlePath(nseed.pos, steps, stepLen)
+		table.insert(noodlePaths, {pts = pts, strength = strength})
+	end
+
+	for xi = 1, voxX, SPARSE_SKIP do
+		for zi = 1, voxZ, SPARSE_SKIP do
+			for yi = 1, voxY do
+				local wx, wy, wz = voxelCenter(xi, yi, zi)
+
+				if wy <= BEDROCK_Y + (BEDROCK_THICKNESS * 0.5) then
+					vox[xi][yi][zi] = 1
+				else
+					if wy <= CAVE_TOP_Y and wy >= BEDROCK_Y then
+						local surfaceH = getNearestSurfaceHeight(wx, wz)
+						local depthFromSurface = surfaceH - wy
+						local cheese = worldNoise3(wx * 0.02, wy * 0.02, wz * 0.02)
+						local spaghetti = worldNoise3((wx + 3000) * 0.04, wy * 0.02, (wz + 6000) * 0.04)
+						local ravine = worldNoise3((wx - 5000) * 0.01, wy * 0.06, (wz - 2000) * 0.01)
+						local combined = cheese * 0.62 + spaghetti * 0.33 + ravine * 0.15
+						local depthFactor = clamp(depthFromSurface / 90, -1, 1)
+						combined = combined + depthFactor * 0.22
+
+						local threshold = CARVE_THRESHOLD_BASE - (depthFromSurface * 0.002)
+						if combined > threshold and depthFromSurface > 1 then
+							local coverRadius = 1
+							for nx = math.max(1, xi - coverRadius), math.min(voxX, xi + coverRadius) do
+								for nz = math.max(1, zi - coverRadius), math.min(voxZ, zi + coverRadius) do
+									vox[nx][yi][nz] = 0
+								end
+							end
+						end
+					end
+				end
+			end
+		end
+	end
+
+	if plan then
+		for _, n in plan.nodes or {} do
+			local cx, cy, cz = n.pos.X, n.pos.Y, n.pos.Z
+			local worldR = n.radius * SPARSE_RADIUS_SCALE
+			local ixMin = clamp(math.floor((cx - worldR - baseWorldX) / stepX) + 1, 1, voxX)
+			local ixMax = clamp(math.floor((cx + worldR - baseWorldX) / stepX) + 1, 1, voxX)
+			local izMin = clamp(math.floor((cz - worldR - baseWorldZ) / stepZ) + 1, 1, voxZ)
+			local izMax = clamp(math.floor((cz + worldR - baseWorldZ) / stepZ) + 1, 1, voxZ)
+			local iyMin = clamp(math.floor((cy - worldR - worldYmin) / BLOCK_SIZE) + 1, 1, voxY)
+			local iyMax = clamp(math.floor((cy + worldR - worldYmin) / BLOCK_SIZE) + 1, 1, voxY)
+
+			for xi = ixMin, ixMax, SPARSE_SKIP do
+				for zi = izMin, izMax, SPARSE_SKIP do
+					for yi = iyMin, iyMax do
+						local wx, wy, wz = voxelCenter(xi, yi, zi)
+						if wy <= CAVE_TOP_Y and wy >= BEDROCK_Y then
+							local d = (Vector3.new(wx,wy,wz) - n.pos).Magnitude
+							if d <= worldR * (1.0 + math.abs(worldNoise3(wx, wy, wz))*0.12) then
+								for nx = math.max(1, xi-1), math.min(voxX, xi+1) do
+									for nz = math.max(1, zi-1), math.min(voxZ, zi+1) do
+										vox[nx][yi][nz] = 0
+									end
+								end
+							end
+						end
+					end
+				end
+			end
+		end
+	end
+
+	if plan then
+		for _, t in plan.tunnels or {} do
+			local a, b, rad = t.a, t.b, t.radius
+			local segLen = (b - a).Magnitude
+			local steps = math.max(3, math.floor(segLen / (BLOCK_SIZE * 1.8)))
+			for s = 0, steps do
+				local p = a:Lerp(b, s / steps)
+				local worldR = rad * SPARSE_RADIUS_SCALE
+				local ixMin = clamp(math.floor((p.X - worldR - baseWorldX) / stepX) + 1, 1, voxX)
+				local ixMax = clamp(math.floor((p.X + worldR - baseWorldX) / stepX) + 1, 1, voxX)
+				local izMin = clamp(math.floor((p.Z - worldR - baseWorldZ) / stepZ) + 1, 1, voxZ)
+				local izMax = clamp(math.floor((p.Z + worldR - baseWorldZ) / stepZ) + 1, 1, voxZ)
+				local iyMin = clamp(math.floor((p.Y - worldR - worldYmin) / BLOCK_SIZE) + 1, 1, voxY)
+				local iyMax = clamp(math.floor((p.Y + worldR - worldYmin) / BLOCK_SIZE) + 1, 1, voxY)
+
+				for xi = ixMin, ixMax, SPARSE_SKIP do
+					for zi = izMin, izMax, SPARSE_SKIP do
+						for yi = iyMin, iyMax do
+							local wx, wy, wz = voxelCenter(xi, yi, zi)
+							if wy <= CAVE_TOP_Y and wy >= BEDROCK_Y then
+								if (Vector3.new(wx,wy,wz) - p).Magnitude <= worldR then
+									for nx = math.max(1, xi-1), math.min(voxX, xi+1) do
+										for nz = math.max(1, zi-1), math.min(voxZ, zi+1) do
+											vox[nx][yi][nz] = 0
+										end
+									end
+								end
+							end
+						end
+					end
+				end
+			end
+			task.wait(0)
+		end
+	end
+
+	for _, noodle in noodlePaths do
+		local pts = noodle.pts
+		local strength = noodle.strength or 1
+		local noodleRadiusBase = 3 + math.floor(1.5 * strength)
+		for i = 1, #pts do
+			local p = pts[i]
+			local rad = noodleRadiusBase + math.floor(math.abs(worldNoise3(p.X, p.Y, p.Z)) * 4)
+			local worldR = rad * SPARSE_RADIUS_SCALE
+			local ixMin = clamp(math.floor((p.X - worldR - baseWorldX) / stepX) + 1, 1, voxX)
+			local ixMax = clamp(math.floor((p.X + worldR - baseWorldX) / stepX) + 1, 1, voxX)
+			local izMin = clamp(math.floor((p.Z - worldR - baseWorldZ) / stepZ) + 1, 1, voxZ)
+			local izMax = clamp(math.floor((p.Z + worldR - baseWorldZ) / stepZ) + 1, 1, voxZ)
+			local iyMin = clamp(math.floor((p.Y - worldR - worldYmin) / BLOCK_SIZE) + 1, 1, voxY)
+			local iyMax = clamp(math.floor((p.Y + worldR - worldYmin) / BLOCK_SIZE) + 1, 1, voxY)
+
+			for xi = ixMin, ixMax do
+				for zi = izMin, izMax do
+					for yi = iyMin, iyMax do
+						local wx, wy, wz = voxelCenter(xi, yi, zi)
+						local d = (Vector3.new(wx,wy,wz) - p).Magnitude
+						if wy <= CAVE_TOP_Y and wy >= BEDROCK_Y and d <= worldR * (1.0 + math.abs(worldNoise3(wx, wy, wz))*0.14) then
+							vox[xi][yi][zi] = 0
+						end
+					end
+				end
+			end
+		end
+	end
+
+	for _, pocket in plan.airPockets or {} do
+		local cx, cy, cz = pocket.pos.X, pocket.pos.Y, pocket.pos.Z
+		local pr = pocket.radius or 3
+		local ixMin = clamp(math.floor((cx - pr - baseWorldX) / stepX) + 1, 1, voxX)
+		local ixMax = clamp(math.floor((cx + pr - baseWorldX) / stepX) + 1, 1, voxX)
+		local izMin = clamp(math.floor((cz - pr - baseWorldZ) / stepZ) + 1, 1, voxZ)
+		local izMax = clamp(math.floor((cz + pr - baseWorldZ) / stepZ) + 1, 1, voxZ)
+		local iyMin = clamp(math.floor((cy - pr - worldYmin) / BLOCK_SIZE) + 1, 1, voxY)
+		local iyMax = clamp(math.floor((cy + pr - worldYmin) / BLOCK_SIZE) + 1, 1, voxY)
+
+		for xi = ixMin, ixMax do
+			for zi = izMin, izMax do
+				for yi = iyMin, iyMax do
+					local wx, wy, wz = voxelCenter(xi, yi, zi)
+					if wy <= CAVE_TOP_Y and wy >= BEDROCK_Y and (Vector3.new(wx,wy,wz) - pocket.pos).Magnitude <= pr * (1.0 + math.noise(wx*0.08, wz*0.08) * 0.2) then
+						vox[xi][yi][zi] = 0
+					end
+				end
+			end
+		end
+	end
+
+	if plan and plan.entrances and #plan.entrances > 0 then
+		for _, ent in plan.entrances do
+			for xi = 1, voxX, SPARSE_SKIP do
+				for zi = 1, voxZ, SPARSE_SKIP do
+					local wx, _, wz = voxelCenter(xi, 1, zi)
+					local dx = wx - ent.x; local dz = wz - ent.z
+					local d = math.sqrt(dx*dx + dz*dz)
+					if d <= ent.radius * 1.45 then
+						for yi = voxY, 1, -1 do
+							local _, wy, _ = voxelCenter(xi, yi, zi)
+							local surfaceH = getNearestSurfaceHeight(wx, wz)
+							if wy <= surfaceH + BLOCK_SIZE * 1.5 and wy <= CAVE_TOP_Y and wy >= BEDROCK_Y then
+								local depth = math.min(math.floor(ent.radius * 3 / BLOCK_SIZE), yi - 1)
+								for dyi = 0, depth do
+									local carveYi = yi - dyi
+									if carveYi >= 1 then
+										for nx = math.max(1, xi-1), math.min(voxX, xi+1) do
+											for nz = math.max(1, zi-1), math.min(voxZ, zi+1) do
+												vox[nx][carveYi][nz] = 0
+										end
+									end
+								end
+							end
+						end
+					end
+				end
+			end
+		end
+
+		if ENABLE_LIGHT_SMOOTH then
+			for iter = 1, 2 do
+				local copy = {}
+				for xi = 1, voxX do
+					copy[xi] = {}
+					for yi = 1, voxY do
+						copy[xi][yi] = {}
+						for zi = 1, voxZ do
+							copy[xi][yi][zi] = vox[xi][yi][zi]
+						end
+					end
+				end
+
+				for xi = 1, voxX do
+					for yi = 1, voxY do
+						for zi = 1, vz do
+							local solid = copy[xi][yi][zi] == 1
+							local neighborSolids = 0
+							for ox = -1, 1 do
+								for oy = -1, 1 do
+									for oz = -1, 1 do
+										if not (ox == 0 and oy == 0 and oz == 0) then
+											local nx = xi + ox; local ny = yi + oy; local nz = zi + oz
+											if nx >= 1 and nx <= voxX and ny >= 1 and ny <= voxY and nz >= 1 and nz <= vz then
+												if copy[nx][ny][nz] == 1 then neighborSolids = neighborSolids + 1 end
+											else
+												neighborSolids = neighborSolids + 1
+											end
+										end
+									end
+								end
+
+							if solid and neighborSolids <= 6 then
+								vox[xi][yi][zi] = 0
+							end
+
+							if (not solid) and neighborSolids >= 20 then
+								vox[xi][yi][zi] = 1
+							end
+						end
+					end
+				end
+			end
+
+			return vox, voxX, voxY, voxZ, worldYmin
+		end
+	end
+end
+
+local function createBlocksFromVoxels_Greedy(chunkModel, vox, vx, vy, vz, worldYmin, baseWorldX, baseWorldZ)
+	local cavesFolder = Instance.new('Model')
+	cavesFolder.Name = 'Caves'
+	cavesFolder.Parent = chunkModel
+	
+	-- fixed validation: ensure all dimensions exist
+	if not (vx and vy and vz) then return end
+	local blockSize = BLOCK_SIZE
+	local stepX = CHUNK_WORLD_SIZE / vx
+	local stepZ = CHUNK_WORLD_SIZE / vz
+
+	local worldXFor, worldZFor = {}, {}
+	for xi = 1, vx do worldXFor[xi] = baseWorldX + (xi - 0.5) * stepX end
+	for zi = 1, vz do worldZFor[zi] = baseWorldZ + (zi - 0.5) * stepZ end
+
+	local occ = {}
+	for xi = 1, vx do
+		occ[xi] = {}
+		for yi = 1, vy do
+			occ[xi][yi] = {}
+			for zi = 1, vz do
+				occ[xi][yi][zi] = vox[xi][yi][zi] == 1
+			end
+		end
+	end
+
+	local partCounter = 0
+	for yi = 1, vy do
+		local layer = {}
+		for xi = 1, vx do
+			layer[xi] = {}
+			for zi = 1, vz do
+				local solid = occ[xi][yi][zi]
+				if not solid then
+					layer[xi][zi] = false
+				else
+					local exposed = false
+					local neighbors = {{1,0,0},{-1,0,0},{0,1,0},{0,-1,0},{0,0,1},{0,0,-1}}
+					for _, off in neighbors do
+						local nx, ny, nz = xi+off[1], yi+off[2], zi+off[3]
+						if nx < 1 or nx > vx or ny < 1 or ny > vy or nz < 1 or nz > vz then
+							exposed = true; break
+						end
+						if not occ[nx][ny][nz] then exposed = true; break end
+					end
+					layer[xi][zi] = exposed
+				end
+			end
+		end
+
+		local visited = {}
+		for xi = 1, vx do visited[xi] = {} for zi = 1, vz do visited[xi][zi] = false end end
+
+		for zi = 1, vz do
+			for xi = 1, vx do
+				if layer[xi][zi] and not visited[xi][zi] then
+					local maxW = 1
+					while xi + maxW <= vx and layer[xi + maxW][zi] and not visited[xi + maxW][zi] do maxW = maxW + 1 end
+					local maxD = 1
+					local ok = true
+					while ok and zi + maxD <= vz do
+						for wx = 0, maxW - 1 do
+							if not (layer[xi + wx][zi + maxD] and not visited[xi + wx][zi + maxD]) then ok = false; break end
+						end
+						if ok then maxD = maxD + 1 end
+					end
+
+					local width = maxW; local depth = maxD
+					local midX = worldXFor[xi] + ((width - 1) * 0.5) * stepX
+					local midZ = worldZFor[zi] + ((depth - 1) * 0.5) * stepZ
+					local midY = worldYmin + (yi - 0.5) * blockSize
+
+					local p = Instance.new('Part')
+					p.Size = Vector3.new(width * stepX, blockSize, depth * stepZ)
+					p.Anchored = true
+					p.CanCollide = true
+					p.CFrame = CFrame.new(midX, midY, midZ)
+
+					if (midY <= (BEDROCK_Y + (BEDROCK_THICKNESS * 0.5))) then
+						p.Material = Enum.Material.Basalt
+						p.Color = Color3.fromRGB(20,20,20)
+						p.Name = "BedrockPart"
+						p.Parent = BedrockFolder
+					else
+						p.Material = Enum.Material.Slate
+						p.Color = Color3.fromRGB(30,30,30)
+						p.Name = "CaveSolid"
+						p.Parent = cavesFolder
+					end
+
+					for dz = 0, depth - 1 do
+						for dx = 0, width - 1 do
+							local mx = xi + dx; local mz = zi + dz
+							visited[mx][mz] = true
+							if occ[mx][yi] then occ[mx][yi][mz] = false end
+						end
+					end
+
+					partCounter = partCounter + 1
+					if partCounter % PARTS_BATCH_SIZE == 0 then task.wait() end
+				end
+			end
+		end
+	end
+
+	return cavesFolder
+end
+
+local function generateBlockCavesForChunk(chunkX, chunkZ, baseWorldX, baseWorldZ, terrainGrid, minHeight, maxHeight, chunkModel)
+	local avgSurface = (minHeight + maxHeight) * 0.5
+	local plan = generateVoxelCavePlan(chunkX, chunkZ, baseWorldX, baseWorldZ, avgSurface)
+
+	mark(terrainGrid, plan.entrances)
+
+	if CurrentHighestPlayerY and (CurrentHighestPlayerY - maxHeight) > 220 then
+		local quickCavesModel = Instance.new('Model')
+		quickCavesModel.Name = 'Caves'
+		quickCavesModel.Parent = chunkModel
+		chunkModel:SetAttribute('BaseWorldX', baseWorldX)
+		chunkModel:SetAttribute('BaseWorldZ', baseWorldZ)
+		return plan, quickCavesModel
+	end
+
+	local vox, vx, vy, vz, worldYmin = carveVoxelGridForChunk(chunkX, chunkZ, baseWorldX, baseWorldZ, minHeight, maxHeight, plan)
+
+	chunkModel:SetAttribute('BaseWorldX', baseWorldX)
+	chunkModel:SetAttribute('BaseWorldZ', baseWorldZ)
+
+	local cavesModel = createBlocksFromVoxels_Greedy(chunkModel, vox, vx, vy, vz, worldYmin, baseWorldX, baseWorldZ)
+
+	return plan, cavesModel
+end
+
+local function mergeBedrockParts()
+	local parts = {}
+	for _, v in BedrockFolder:GetChildren() do
+		if v:IsA("BasePart") and v.Name == "BedrockPart" then
+			table.insert(parts, v)
+		end
+	end
+
+	if #parts <= 1 then return end
+
+	local grid = {}
+	local function keyFromPart(p)
+
+		local cx, cz = p.Position.X, p.Position.Z
+		local gx = math.floor((cx + 0.5 * CHUNK_WORLD_SIZE) / CHUNK_WORLD_SIZE)
+		local gz = math.floor((cz + 0.5 * CHUNK_WORLD_SIZE) / CHUNK_WORLD_SIZE)
+		local ky = string.format("%d|%d|%d", gx, gz, math.floor(p.Position.Y*100))
+		return ky, gx, gz
+	end
+
+	for _, p in parts do
+		local ky, gx, gz = keyFromPart(p)
+		grid[ky] = grid[ky] or {}
+		table.insert(grid[ky], p)
+	end
+
+	local mergedAny = false
+	local used = {}
+	for _, p in parts do
+		if not p.Parent then
+			used[p] = true
+		end
+	end
+
+	local function tryMergeAlongAxis(axis)
+		local didMerge = false
+		local index = {}
+		for _, p in parts do
+			if p and p.Parent and p.Name == "BedrockPart" then
+				local cx, cz = p.Position.X, p.Position.Z
+				local gx = math.floor((cx + 0.5 * CHUNK_WORLD_SIZE) / CHUNK_WORLD_SIZE)
+				local gz = math.floor((cz + 0.5 * CHUNK_WORLD_SIZE) / CHUNK_WORLD_SIZE)
+				local ky = gx .. "|" .. gz .. "|" .. tostring(math.floor(p.Position.Y*100))
+				index[ky] = index[ky] or {}
+				table.insert(index[ky], p)
+			end
+		end
+
+		local processed = {}
+		for ky, list in index do
+			local changed = true
+			while changed do
+				changed = false
+				for i = 1, #list do
+					local a = list[i]
+					if not a or not a.Parent then continue end
+					for j = i+1, #list do
+						local b = list[j]
+						if not b or not b.Parent then continue end
+						if math.abs(a.Position.Y - b.Position.Y) > 0.01 or math.abs(a.Size.Y - b.Size.Y) > 0.01 then continue end
+						if axis == "X" then
+							if math.abs(a.Position.Z - b.Position.Z) > 0.05 then continue end
+							if math.abs(a.Size.Z - b.Size.Z) > 0.05 then continue end
+							local aMinX = a.Position.X - a.Size.X*0.5
+							local aMaxX = a.Position.X + a.Size.X*0.5
+							local bMinX = b.Position.X - b.Size.X*0.5
+							local bMaxX = b.Position.X + b.Size.X*0.5
+
+							if math.abs(aMaxX - bMinX) <= 0.05 or math.abs(bMaxX - aMinX) <= 0.05 then
+								local newMinX = math.min(aMinX, bMinX)
+								local newMaxX = math.max(aMaxX, bMaxX)
+								local newSizeX = newMaxX - newMinX
+								local newMidX = (newMinX + newMaxX) * 0.5
+								local newPart = Instance.new("Part")
+								newPart.Size = Vector3.new(newSizeX, a.Size.Y, a.Size.Z)
+								newPart.Anchored = true
+								newPart.CanCollide = true
+								newPart.Material = Enum.Material.Basalt
+								newPart.Color = Color3.fromRGB(20,20,20)
+								newPart.CFrame = CFrame.new(newMidX, a.Position.Y, a.Position.Z)
+								newPart.Name = "BedrockPart"
+								newPart.Parent = BedrockFolder
+
+								a:Destroy()
+								b:Destroy()
+
+								list[i] = newPart
+								table.remove(list, j)
+								changed = true
+								didMerge = true
+								break
+							end
+						else
+							if math.abs(a.Position.X - b.Position.X) > 0.05 then continue end
+							if math.abs(a.Size.X - b.Size.X) > 0.05 then continue end
+							local aMinZ = a.Position.Z - a.Size.Z*0.5
+							local aMaxZ = a.Position.Z + a.Size.Z*0.5
+							local bMinZ = b.Position.Z - b.Size.Z*0.5
+							local bMaxZ = b.Position.Z + b.Size.Z*0.5
+							if math.abs(aMaxZ - bMinZ) <= 0.05 or math.abs(bMaxZ - aMinZ) <= 0.05 then
+								local newMinZ = math.min(aMinZ, bMinZ)
+								local newMaxZ = math.max(aMaxZ, bMaxZ)
+								local newSizeZ = newMaxZ - newMinZ
+								local newMidZ = (newMinZ + newMaxZ) * 0.5
+								local newPart = Instance.new("Part")
+								newPart.Size = Vector3.new(a.Size.X, a.Size.Y, newSizeZ)
+								newPart.Anchored = true
+								newPart.CanCollide = true
+								newPart.Material = Enum.Material.Basalt
+								newPart.Color = Color3.fromRGB(20,20,20)
+								newPart.CFrame = CFrame.new(a.Position.X, a.Position.Y, newMidZ)
+								newPart.Name = "BedrockPart"
+								newPart.Parent = BedrockFolder
+								a:Destroy()
+								b:Destroy()
+								list[i] = newPart
+								table.remove(list, j)
+								changed = true
+								didMerge = true
+								break
+							end
+						end
+						continue
+					end
+					continue
+				end
+			end
+			return didMerge
+		end
+
+	local maxIterations = 6
+	for iter = 1, maxIterations do
+		local m1 = tryMergeAlongAxis("X")
+		local m2 = tryMergeAlongAxis("Z")
+		if not m1 and not m2 then break end
+	end
+end
+
+task.spawn(function()
+	while true do
+		task.wait(8)
+		local success, err = pcall(function()
+
+			local count = 0
+			for _, c in BedrockFolder:GetChildren() do
+				if c:IsA("BasePart") and c.Name == "BedrockPart" then count = count + 1 end
+			end
+			if count >= 2 then
+				mergeBedrockParts()
+			end
+		end)
+		if not success then
+			warn("Bedrock merge error:", err)
+		end
+	end
+end)
+
+local function generateChunk(chunkX: number, chunkZ: number): ()
+	local terrainData: {{
+		worldX: number,
+		worldZ: number,
+		finalHeight: number,
+		canAddDeco: boolean,
+		isSlate: boolean
+	}} = {}
+
+	-- store simple descriptors for trees (not full CFrames) so we can compute offsets when we instantiate
+	local treePositions = {}
+	local partsGenerated: number = 0
+
+	local baseWorldX: number = chunkX * CHUNK_WORLD_SIZE
+	local baseWorldZ: number = chunkZ * CHUNK_WORLD_SIZE
+
+	local terrainGrid = {}
+	local minHeight: number = math.huge
+	local maxHeight: number = -math.huge
+
+	for x = 1, CHUNK_SIZE do
+		terrainGrid[x] = {}
+		for z = 1, CHUNK_SIZE do
+			local worldX: number = baseWorldX + (x - 1) * 5
+			local worldZ: number = baseWorldZ + (z - 1) * 5
+
+			local baseHeight: number = getBaseHeight(worldX, worldZ)
+
+			local distanceFromSpawn: number = math.sqrt(worldX * worldX + worldZ * worldZ)
+
+			local noiseMultiplier: number = HILL_INTENSITY * math.max(0.5, 1 - (distanceFromSpawn / 2000))
+
+			local noise1: number = math.noise(worldX/300, worldZ/300)
+			local noise2: number = math.noise(worldX/100, worldZ/100) * 0.5
+			local noise3: number = math.noise(worldX/30, worldZ/30) * 0.2
+
+			local combinedNoise: number = (noise1 + noise2 + noise3) * BASE_SCALE * noiseMultiplier
+
+			if combinedNoise < MIN_SLOPE_VALUE then
+				combinedNoise = MIN_SLOPE_VALUE
+			end
+
+			local finalHeight: number = baseHeight + combinedNoise
+
+			if finalHeight < minHeight then
+				minHeight = finalHeight
+			end
+			if finalHeight > maxHeight then
+				maxHeight = finalHeight
+			end
+
+			local canAddDeco: boolean = false
+			if finalHeight > 10 then
+				canAddDeco = math.random(1, 50) == 25
+			end
+
+			local isSlate: boolean = finalHeight > 300 and math.random(1, 8) == 1
+
+			terrainGrid[x][z] = {
+				worldX = worldX,
+				worldZ = worldZ,
+				finalHeight = finalHeight,
+				canAddDeco = canAddDeco,
+				isSlate = isSlate,
+				merged = false,
+				isHole = false
+			}
+		end
+	end
+
+	local chunkModel: Model = Instance.new("Model")
+	chunkModel.Name = "Chunk_" .. chunkX .. "_" .. chunkZ
+	-- this line is to prevent Roblox streaming from unloading the chunk
+	-- DO NOT TOUCH THIS NO MATTER WHAT! during testing, it is best to have this enabled.
+	chunkModel.ModelStreamingMode = Enum.ModelStreamingMode.Persistent -- Prevent Roblox streaming from unloading
+
+	local plan, cavesModel = generateBlockCavesForChunk(chunkX, chunkZ, baseWorldX, baseWorldZ, terrainGrid, minHeight, maxHeight, chunkModel)
+
+	for x = 1, CHUNK_SIZE do
+		for z = 1, CHUNK_SIZE do
+			local cell = terrainGrid[x][z]
+			if not cell.merged then
+				local mergeWidth = 1
+				for nextZ = z + 1, CHUNK_SIZE do
+					local nextCell = terrainGrid[x][nextZ]
+					if nextCell.merged then
+						break
+					end
+
+					local heightDiff = math.abs(cell.finalHeight - nextCell.finalHeight)
+					if heightDiff <= HEIGHT_MERGE_TOLERANCE and cell.isSlate == nextCell.isSlate and not cell.isHole and not nextCell.isHole then
+						mergeWidth = mergeWidth + 1
+						nextCell.merged = true
+					else
+						break
+					end
+				end
+
+				table.insert(terrainData, {
+					worldX = cell.worldX,
+					worldZ = cell.worldZ,
+					finalHeight = cell.finalHeight,
+					canAddDeco = cell.canAddDeco,
+					isSlate = cell.isSlate,
+					mergeWidth = mergeWidth
+				})
+				cell.merged = true
+			end
+		end
+	end
+
+	local originalPartCount = CHUNK_SIZE * CHUNK_SIZE
+	local mergedPartCount = #terrainData
+	local reduction = math.floor((1 - mergedPartCount / originalPartCount) * 100)
+	local heightRange = maxHeight - minHeight
+
+	local firstPart: Part? = nil
+
+	for _, data in terrainData do
+		local part: Part = Instance.new("Part")
+
+		local mergeWidth = data.mergeWidth or 1
+		local partSizeZ = 5 * mergeWidth
+		local offsetZ = (mergeWidth - 1) * 2.5
+
+		part.Size = Vector3.new(5, 5, partSizeZ)
+		part.CFrame = CFrame.new(data.worldX, data.finalHeight, data.worldZ + offsetZ)
+		part.Anchored = true
+		part.TopSurface = Enum.SurfaceType.Smooth
+		part.BottomSurface = Enum.SurfaceType.Smooth
+
+		part.CanTouch = false
+		part.CanCollide = true
+		part.CanQuery = true
+
+		if data.isSlate then
+			part.Material = Enum.Material.Slate
+			part.Color = slateColor
+		else
+			part.Material = Enum.Material.Grass
+			part.Color = grassColor
+		end
+
+		if not firstPart then
+			firstPart = part
+		end
+
+		if data.canAddDeco then
+			-- store descriptor, compute exact pivot at spawn to avoid floating
+			table.insert(treePositions, { x = data.worldX, z = data.worldZ, y = data.finalHeight })
+		end
+
+		part.Parent = chunkModel
+
+		partsGenerated = partsGenerated + 1
+
+		if partsGenerated % PARTS_BATCH_SIZE == 0 then
+			task.wait()
+		end
+	end
+
+	if firstPart then
+		chunkModel.PrimaryPart = firstPart
+	end
+
+	chunkModel.Parent = Map
+
+	-- Spawn trees using model extents and parent them to the chunk (prevents floating/unloaded mismatch)
+	if #treePositions > 0 then
+		task.spawn(function()
+			for i, spawnInfo in ipairs(treePositions) do
+				local ok, tree = pcall(function() return ServerStorage.Items.Materials.tree:Clone() end)
+				if not ok or not tree then
+					continue
+				end
+
+				-- compute vertical offset from model extents so tree sits on the terrain surface
+				local size = tree:GetExtentsSize()
+				local verticalOffset = size.Y * 0.5
+
+				local rotY = math.rad(math.random(0, 359))
+				local targetCFrame = CFrame.new(spawnInfo.x, spawnInfo.y + verticalOffset, spawnInfo.z) * CFrame.Angles(0, rotY, 0)
+				tree:PivotTo(targetCFrame)
+
+				-- parent to chunk so it moves/unloads with the chunk
+				tree.Parent = chunkModel
+
+				-- yield occasionally for performance
+				if i % 2 == 0 then
+					task.wait()
+				end
+			end
+		end)
+	end
+
+	local chunkKey: string = getChunkKey(chunkX, chunkZ)
+	loadedChunks[chunkKey] = true
+	generatingChunks[chunkKey] = nil
+	chunksGenerated = chunksGenerated + 1
+end
+
+local function requestChunkGeneration(chunkX: number, chunkZ: number): ()
+	local chunkKey: string = getChunkKey(chunkX, chunkZ)
+
+	if loadedChunks[chunkKey] or generatingChunks[chunkKey] then
+		return
+	end
+
+	generatingChunks[chunkKey] = true
+
+	task.spawn(function()
+		generateChunk(chunkX, chunkZ)
+	end)
+end
+
+local function updateChunks(): ()
+	local currentTime: number = tick()
+	if currentTime - lastUpdateTime < 1 then
+		return
+	end
+	lastUpdateTime = currentTime
+
+	local highestY = nil
+	for _, player: Player in Players:GetPlayers() do
+		if player.Character and player.Character:FindFirstChild("HumanoidRootPart") then
+			local py = player.Character.HumanoidRootPart.Position.Y
+			if not highestY or py > highestY then highestY = py end
+		end
+	end
+	CurrentHighestPlayerY = highestY
+
+	for _, player: Player in Players:GetPlayers() do
+		if player.Character and player.Character:FindFirstChild("HumanoidRootPart") then
+			local playerPosition: Vector3 = player.Character.HumanoidRootPart.Position
+			local playerChunkX: number, playerChunkZ: number = getChunkCoords(playerPosition)
+
+			local chunksToQueue: {{number}} = {}
+
+			local currentRenderDistance = initialLoadComplete and RENDER_DISTANCE or INITIAL_RENDER_DISTANCE
+
+			for x = playerChunkX - currentRenderDistance, playerChunkX + currentRenderDistance do
+				for z = playerChunkZ - currentRenderDistance, playerChunkZ + currentRenderDistance do
+					local chunkKey: string = getChunkKey(x, z)
+					if not loadedChunks[chunkKey] and not generatingChunks[chunkKey] and not queuedChunks[chunkKey] then
+						local chunkWorldX: number = x * CHUNK_WORLD_SIZE
+						local chunkWorldZ: number = z * CHUNK_WORLD_SIZE
+						local dx: number = chunkWorldX - playerPosition.X
+						local dz: number = chunkWorldZ - playerPosition.Z
+						local distance: number = math.sqrt(dx * dx + dz * dz)
+						table.insert(chunksToQueue, {x, z, distance})
+						queuedChunks[chunkKey] = true
+					end
+				end
+			end
+
+			table.sort(chunksToQueue, function(a, b)
+				return a[3] < b[3]
+			end)
+
+			for _, chunkData in chunksToQueue do
+				table.insert(chunkQueue, {chunkData[1], chunkData[2]})
+			end
+
+			if not initialLoadComplete and #chunksToQueue == 0 then
+				initialLoadComplete = true
+			end
+		end
+	end
+end
+
+local function processChunkQueue(): ()
+	if #chunkQueue == 0 then
+		return
+	end
+
+	local chunksToProcess: number = INSTANT_LOAD and math.min(#chunkQueue, 10) or 1
+
+	for i = 1, chunksToProcess do
+		if #chunkQueue == 0 then
+			break
+		end
+
+		local coords: {number} = table.remove(chunkQueue, 1)
+		if coords then
+			local chunkKey: string = getChunkKey(coords[1], coords[2])
+			queuedChunks[chunkKey] = nil
+			requestChunkGeneration(coords[1], coords[2])
+		end
+	end
+end
+
+RunService.Heartbeat:Connect(updateChunks)
+RunService.Heartbeat:Connect(processChunkQueue)
+
+-- (Due to length, I will now populate it.)
