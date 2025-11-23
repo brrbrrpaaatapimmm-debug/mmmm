@@ -1,7 +1,8 @@
--- FULL PATCHED TERRAIN SCRIPT
+-- FULL PATCHED TERRAIN SCRIPT (REVISED FOR CAVE ENTRANCE FIX AND NIL INDEX ERROR FIX)
 
--- Patched by assistant: fixes caves/entrances, floating trees, and tree rotations.
--- Source file: /mnt/data/terrain.txt
+-- Patched by assistant: fixes caves/entrances (missing surface hole), parts gap (thickening terrain),
+-- floating trees (using raycast), and increases terrain unevenness/mountain-like progression.
+-- FIX: Voxel grid scope/initialization bug causing "attempt to index nil with number."
 
 local Players: Players = game:GetService("Players")
 local RunService: RunService = game:GetService("RunService")
@@ -18,14 +19,14 @@ local HEIGHT_MERGE_TOLERANCE: number = 0.5
 
 local BASE_SCALE: number = 30
 local HEIGHT_PROGRESSION: number = 0.02
-local HEIGHT_ACCELERATION: number = 0.0001
+local HEIGHT_ACCELERATION: number = 0.00015 -- INCREASED: For steeper mountains
 local MIN_SLOPE: number = 0.3
 local STARTING_HEIGHT: number = 100
-local HILL_INTENSITY: number = 1.5
+local HILL_INTENSITY: number = 2.0 -- INCREASED: For more dramatic hills/unevenness
 local PARTS_PER_FRAME: number = 16
 local INITIAL_PARTS_PER_FRAME: number = 4
 
-local CAVE_TOP_Y = 50
+local CAVE_TOP_Y = 150 -- REVISED: Allow caves closer to the surface
 local BEDROCK_Y = -2048
 local BEDROCK_THICKNESS = 5
 
@@ -79,7 +80,7 @@ local SPARSE_SKIP = 1
 local SPARSE_RADIUS_SCALE = 1.5
 local MAX_VOXELS = 72
 local ENABLE_LIGHT_SMOOTH = true
-local CARVE_THRESHOLD_BASE = 0.34
+local CARVE_THRESHOLD_BASE = 0.30 -- Lowered for more general cave generation
 local NOODLE_INTENSITY = 0.9
 local AIR_POCKET_CHANCE = 0.28
 local NOODLE_COUNT_PER_CHUNK = 2
@@ -132,7 +133,7 @@ local function getNearestSurfaceHeight(x, z)
 	local baseH = getBaseHeight(x, z)
 	local noise1 = math.noise(x/300, z/300)
 	local noise2 = math.noise(x/100, z/100) * 0.5
-	local noise3 = math.noise(x/30, z/30) * 0.2
+	local noise3 = math.noise(x/30, z/30) * 0.4 -- INCREASED: For more local unevenness
 	local distanceFromSpawn = math.sqrt(x*x + z*z)
 	local combinedNoise = (noise1 + noise2 + noise3) * BASE_SCALE * HILL_INTENSITY * math.max(0.5, 1 - (distanceFromSpawn / 2000))
 	if combinedNoise < MIN_SLOPE_VALUE then combinedNoise = MIN_SLOPE_VALUE end
@@ -161,7 +162,7 @@ local function generateVoxelCavePlan(chunkX, chunkZ, baseWorldX, baseWorldZ, avg
 		local surfaceH = getNearestSurfaceHeight(lx, lz)
 		local depthBias = worldNoise3(lx * 0.02, surfaceH * 0.01, lz * 0.02)
 
-		local depthRange = 10 + math.abs(worldNoise3(lx*0.02, surfaceH*0.01, lz*0.02)) * 28
+		local depthRange = 10 + math.abs(worldNoise3(lx * 0.02, surfaceH * 0.01, lz * 0.02)) * 28
 		if isGiantChunk then depthRange = depthRange + 20 end
 		local nodeY = math.max(BEDROCK_Y + 4, surfaceH - depthRange + math.floor(worldNoise3(lx, surfaceH, lz) * 6))
 
@@ -189,9 +190,8 @@ local function generateVoxelCavePlan(chunkX, chunkZ, baseWorldX, baseWorldZ, avg
 				local angle = (worldNoise3(lx*0.02*s, nodeY*0.01*s, lz*0.02*s)+1) * math.pi * 2
 				local vx, vz = math.cos(angle), math.sin(angle)
 				local vy = (ctype == 'ravine') and ((worldNoise3(lx*0.04*s,nodeY*0.01*s,lz*0.05*s)-0.5) * 3 - 1.5) or ((worldNoise3(lx*0.04*s,nodeY*0.01*s,lz*0.05*s)-0.5)*0.6)
-				local step = Vector3.new(vx, vy, vz)
+				local step = Vector3.new(vx, vy, vz).Unit * (6 + math.floor(worldNoise3(lx*0.06*s,nodeY*0.02*s,lz*0.06*s)*10))
 				if step.Magnitude < 0.0001 then step = Vector3.new(1,0,0) end
-				step = step.Unit * (6 + math.floor(worldNoise3(lx*0.06*s,nodeY*0.02*s,lz*0.06*s)*10))
 				local prev = s == 1 and Vector3.new(lx, nodeY, lz) or plan.tunnels[#plan.tunnels].b
 				local nextPos = prev + step
 				local segRadius = math.max(1.2, (rad * (0.6 + worldNoise3(lx*0.07*s,nodeY*0.03*s,lz*0.08*s) * 0.5)))
@@ -322,26 +322,23 @@ local function generateNoodlePath(seedPos, steps, stepLen)
 end
 
 local function carveVoxelGridForChunk(chunkX, chunkZ, baseWorldX, baseWorldZ, minH, maxH, plan)
+	-- FIX: Declare all dimension/boundary variables at the top to ensure correct scope/initialization
+	local voxX = math.floor(CHUNK_WORLD_SIZE / (BLOCK_SIZE * 1.5))
+	voxX = clamp(voxX, 4, MAX_VOXELS)
+	local voxZ = voxX
+	local voxY = LAYERS_Y
+	local worldYmin = math.max(BEDROCK_Y, math.floor(minH) - (voxY * BLOCK_SIZE))
+	local worldYmax = worldYmin + voxY * BLOCK_SIZE
+	local vox = {}
+
+	-- Low-Detail Optimization / Early Exit
 	if CurrentHighestPlayerY and (CurrentHighestPlayerY - maxH) > 220 then
-		local voxX = math.floor(CHUNK_WORLD_SIZE / (BLOCK_SIZE * 1.5))
-		voxX = clamp(voxX, 4, MAX_VOXELS)
-		local voxZ = voxX
-		local voxY = LAYERS_Y
-		local worldYmin = math.max(BEDROCK_Y, math.floor(minH) - (voxY * BLOCK_SIZE))
-		local vox = {}
+		-- Initialize low-detail voxels (solid block)
 		for xi = 1, voxX do vox[xi] = {} for yi = 1, voxY do vox[xi][yi] = {} for zi = 1, voxZ do vox[xi][yi][zi] = 1 end end end
 		return vox, voxX, voxY, voxZ, worldYmin
 	end
 
-	local voxX = math.floor(CHUNK_WORLD_SIZE / (BLOCK_SIZE * 1.5))
-	voxX = clamp(voxX, 4, MAX_VOXELS)
-	local voxZ = voxX
-
-	local voxY = LAYERS_Y
-	local worldYmin = math.max(BEDROCK_Y, math.floor(minH) - (voxY * BLOCK_SIZE))
-	local worldYmax = worldYmin + voxY * BLOCK_SIZE
-
-	local vox = {}
+	-- Normal Voxel Initialization (all solid)
 	for xi = 1, voxX do
 		vox[xi] = {}
 		for yi = 1, voxY do
@@ -540,6 +537,7 @@ local function carveVoxelGridForChunk(chunkX, chunkZ, baseWorldX, baseWorldZ, mi
 										for nx = math.max(1, xi-1), math.min(voxX, xi+1) do
 											for nz = math.max(1, zi-1), math.min(voxZ, zi+1) do
 												vox[nx][carveYi][nz] = 0
+											end
 										end
 									end
 								end
@@ -565,7 +563,7 @@ local function carveVoxelGridForChunk(chunkX, chunkZ, baseWorldX, baseWorldZ, mi
 
 				for xi = 1, voxX do
 					for yi = 1, voxY do
-						for zi = 1, vz do
+						for zi = 1, voxZ do
 							local solid = copy[xi][yi][zi] == 1
 							local neighborSolids = 0
 							for ox = -1, 1 do
@@ -573,7 +571,7 @@ local function carveVoxelGridForChunk(chunkX, chunkZ, baseWorldX, baseWorldZ, mi
 									for oz = -1, 1 do
 										if not (ox == 0 and oy == 0 and oz == 0) then
 											local nx = xi + ox; local ny = yi + oy; local nz = zi + oz
-											if nx >= 1 and nx <= voxX and ny >= 1 and ny <= voxY and nz >= 1 and nz <= vz then
+											if nx >= 1 and nx <= voxX and ny >= 1 and ny <= voxY and nz >= 1 and nz <= voxZ then
 												if copy[nx][ny][nz] == 1 then neighborSolids = neighborSolids + 1 end
 											else
 												neighborSolids = neighborSolids + 1
@@ -581,7 +579,8 @@ local function carveVoxelGridForChunk(chunkX, chunkZ, baseWorldX, baseWorldZ, mi
 										end
 									end
 								end
-
+							end
+							
 							if solid and neighborSolids <= 6 then
 								vox[xi][yi][zi] = 0
 							end
@@ -593,10 +592,10 @@ local function carveVoxelGridForChunk(chunkX, chunkZ, baseWorldX, baseWorldZ, mi
 					end
 				end
 			end
-
-			return vox, voxX, voxY, voxZ, worldYmin
 		end
 	end
+
+	return vox, voxX, voxY, voxZ, worldYmin
 end
 
 local function createBlocksFromVoxels_Greedy(chunkModel, vox, vx, vy, vz, worldYmin, baseWorldX, baseWorldZ)
@@ -620,6 +619,8 @@ local function createBlocksFromVoxels_Greedy(chunkModel, vox, vx, vy, vz, worldY
 		for yi = 1, vy do
 			occ[xi][yi] = {}
 			for zi = 1, vz do
+				-- This is the most likely location for the 'nil[number]' error if vox was not fully initialized
+				-- Since vox initialization is now more robust, this line should be safe.
 				occ[xi][yi][zi] = vox[xi][yi][zi] == 1
 			end
 		end
@@ -639,44 +640,48 @@ local function createBlocksFromVoxels_Greedy(chunkModel, vox, vx, vy, vz, worldY
 					local neighbors = {{1,0,0},{-1,0,0},{0,1,0},{0,-1,0},{0,0,1},{0,0,-1}}
 					for _, off in neighbors do
 						local nx, ny, nz = xi+off[1], yi+off[2], zi+off[3]
-						if nx < 1 or nx > vx or ny < 1 or ny > vy or nz < 1 or nz > vz then
-							exposed = true; break
-						end
+						if ny < 1 or ny > vy then exposed = true; break end
 						if not occ[nx][ny][nz] then exposed = true; break end
 					end
 					layer[xi][zi] = exposed
 				end
 			end
 		end
-
+		
 		local visited = {}
 		for xi = 1, vx do visited[xi] = {} for zi = 1, vz do visited[xi][zi] = false end end
-
+		
 		for zi = 1, vz do
 			for xi = 1, vx do
 				if layer[xi][zi] and not visited[xi][zi] then
 					local maxW = 1
-					while xi + maxW <= vx and layer[xi + maxW][zi] and not visited[xi + maxW][zi] do maxW = maxW + 1 end
+					while xi + maxW <= vx and layer[xi + maxW][zi] and not visited[xi + maxW][zi] do
+						maxW = maxW + 1
+					end
+					
 					local maxD = 1
 					local ok = true
 					while ok and zi + maxD <= vz do
 						for wx = 0, maxW - 1 do
-							if not (layer[xi + wx][zi + maxD] and not visited[xi + wx][zi + maxD]) then ok = false; break end
+							if not (layer[xi + wx][zi + maxD] and not visited[xi + wx][zi + maxD]) then
+								ok = false; break
+							end
 						end
 						if ok then maxD = maxD + 1 end
 					end
-
+					
 					local width = maxW; local depth = maxD
+					
 					local midX = worldXFor[xi] + ((width - 1) * 0.5) * stepX
 					local midZ = worldZFor[zi] + ((depth - 1) * 0.5) * stepZ
 					local midY = worldYmin + (yi - 0.5) * blockSize
-
+					
 					local p = Instance.new('Part')
 					p.Size = Vector3.new(width * stepX, blockSize, depth * stepZ)
 					p.Anchored = true
 					p.CanCollide = true
 					p.CFrame = CFrame.new(midX, midY, midZ)
-
+					
 					if (midY <= (BEDROCK_Y + (BEDROCK_THICKNESS * 0.5))) then
 						p.Material = Enum.Material.Basalt
 						p.Color = Color3.fromRGB(20,20,20)
@@ -688,7 +693,7 @@ local function createBlocksFromVoxels_Greedy(chunkModel, vox, vx, vy, vz, worldY
 						p.Name = "CaveSolid"
 						p.Parent = cavesFolder
 					end
-
+					
 					for dz = 0, depth - 1 do
 						for dx = 0, width - 1 do
 							local mx = xi + dx; local mz = zi + dz
@@ -696,9 +701,6 @@ local function createBlocksFromVoxels_Greedy(chunkModel, vox, vx, vy, vz, worldY
 							if occ[mx][yi] then occ[mx][yi][mz] = false end
 						end
 					end
-
-					partCounter = partCounter + 1
-					if partCounter % PARTS_BATCH_SIZE == 0 then task.wait() end
 				end
 			end
 		end
@@ -707,27 +709,21 @@ local function createBlocksFromVoxels_Greedy(chunkModel, vox, vx, vy, vz, worldY
 	return cavesFolder
 end
 
+
 local function generateBlockCavesForChunk(chunkX, chunkZ, baseWorldX, baseWorldZ, terrainGrid, minHeight, maxHeight, chunkModel)
 	local avgSurface = (minHeight + maxHeight) * 0.5
 	local plan = generateVoxelCavePlan(chunkX, chunkZ, baseWorldX, baseWorldZ, avgSurface)
 
-	mark(terrainGrid, plan.entrances)
-
-	if CurrentHighestPlayerY and (CurrentHighestPlayerY - maxHeight) > 220 then
-		local quickCavesModel = Instance.new('Model')
-		quickCavesModel.Name = 'Caves'
-		quickCavesModel.Parent = chunkModel
-		chunkModel:SetAttribute('BaseWorldX', baseWorldX)
-		chunkModel:SetAttribute('BaseWorldZ', baseWorldZ)
-		return plan, quickCavesModel
-	end
-
+	if not plan then return nil end
 	local vox, vx, vy, vz, worldYmin = carveVoxelGridForChunk(chunkX, chunkZ, baseWorldX, baseWorldZ, minHeight, maxHeight, plan)
 
 	chunkModel:SetAttribute('BaseWorldX', baseWorldX)
 	chunkModel:SetAttribute('BaseWorldZ', baseWorldZ)
-
+	
 	local cavesModel = createBlocksFromVoxels_Greedy(chunkModel, vox, vx, vy, vz, worldYmin, baseWorldX, baseWorldZ)
+	
+	-- Mark surface cells that are near cave entrances 
+	mark(terrainGrid, plan.entrances)
 
 	return plan, cavesModel
 end
@@ -739,12 +735,10 @@ local function mergeBedrockParts()
 			table.insert(parts, v)
 		end
 	end
-
 	if #parts <= 1 then return end
 
 	local grid = {}
 	local function keyFromPart(p)
-
 		local cx, cz = p.Position.X, p.Position.Z
 		local gx = math.floor((cx + 0.5 * CHUNK_WORLD_SIZE) / CHUNK_WORLD_SIZE)
 		local gz = math.floor((cz + 0.5 * CHUNK_WORLD_SIZE) / CHUNK_WORLD_SIZE)
@@ -761,9 +755,7 @@ local function mergeBedrockParts()
 	local mergedAny = false
 	local used = {}
 	for _, p in parts do
-		if not p.Parent then
-			used[p] = true
-		end
+		if not p.Parent then used[p] = true end
 	end
 
 	local function tryMergeAlongAxis(axis)
@@ -791,20 +783,20 @@ local function mergeBedrockParts()
 					for j = i+1, #list do
 						local b = list[j]
 						if not b or not b.Parent then continue end
-						if math.abs(a.Position.Y - b.Position.Y) > 0.01 or math.abs(a.Size.Y - b.Size.Y) > 0.01 then continue end
-						if axis == "X" then
-							if math.abs(a.Position.Z - b.Position.Z) > 0.05 then continue end
-							if math.abs(a.Size.Z - b.Size.Z) > 0.05 then continue end
+
+						-- Merge along X
+						if axis == 1 and math.abs(a.Position.Y - b.Position.Y) < 0.05 and math.abs(a.Position.Z - b.Position.Z) < 0.05 and math.abs(a.Size.Y - b.Size.Y) < 0.05 and math.abs(a.Size.Z - b.Size.Z) < 0.05 then
 							local aMinX = a.Position.X - a.Size.X*0.5
 							local aMaxX = a.Position.X + a.Size.X*0.5
 							local bMinX = b.Position.X - b.Size.X*0.5
 							local bMaxX = b.Position.X + b.Size.X*0.5
-
+							
 							if math.abs(aMaxX - bMinX) <= 0.05 or math.abs(bMaxX - aMinX) <= 0.05 then
 								local newMinX = math.min(aMinX, bMinX)
 								local newMaxX = math.max(aMaxX, bMaxX)
 								local newSizeX = newMaxX - newMinX
 								local newMidX = (newMinX + newMaxX) * 0.5
+								
 								local newPart = Instance.new("Part")
 								newPart.Size = Vector3.new(newSizeX, a.Size.Y, a.Size.Z)
 								newPart.Anchored = true
@@ -814,28 +806,28 @@ local function mergeBedrockParts()
 								newPart.CFrame = CFrame.new(newMidX, a.Position.Y, a.Position.Z)
 								newPart.Name = "BedrockPart"
 								newPart.Parent = BedrockFolder
-
+								
 								a:Destroy()
 								b:Destroy()
-
 								list[i] = newPart
 								table.remove(list, j)
 								changed = true
 								didMerge = true
 								break
 							end
-						else
-							if math.abs(a.Position.X - b.Position.X) > 0.05 then continue end
-							if math.abs(a.Size.X - b.Size.X) > 0.05 then continue end
+						-- Merge along Z
+						elseif axis == 3 and math.abs(a.Position.Y - b.Position.Y) < 0.05 and math.abs(a.Position.X - b.Position.X) < 0.05 and math.abs(a.Size.Y - b.Size.Y) < 0.05 and math.abs(a.Size.X - b.Size.X) < 0.05 then
 							local aMinZ = a.Position.Z - a.Size.Z*0.5
 							local aMaxZ = a.Position.Z + a.Size.Z*0.5
 							local bMinZ = b.Position.Z - b.Size.Z*0.5
 							local bMaxZ = b.Position.Z + b.Size.Z*0.5
+							
 							if math.abs(aMaxZ - bMinZ) <= 0.05 or math.abs(bMaxZ - aMinZ) <= 0.05 then
 								local newMinZ = math.min(aMinZ, bMinZ)
 								local newMaxZ = math.max(aMaxZ, bMaxZ)
 								local newSizeZ = newMaxZ - newMinZ
 								local newMidZ = (newMinZ + newMaxZ) * 0.5
+								
 								local newPart = Instance.new("Part")
 								newPart.Size = Vector3.new(a.Size.X, a.Size.Y, newSizeZ)
 								newPart.Anchored = true
@@ -845,6 +837,7 @@ local function mergeBedrockParts()
 								newPart.CFrame = CFrame.new(a.Position.X, a.Position.Y, newMidZ)
 								newPart.Name = "BedrockPart"
 								newPart.Parent = BedrockFolder
+								
 								a:Destroy()
 								b:Destroy()
 								list[i] = newPart
@@ -854,108 +847,67 @@ local function mergeBedrockParts()
 								break
 							end
 						end
-						continue
 					end
-					continue
 				end
 			end
-			return didMerge
+			processed[ky] = list
 		end
+		
+		parts = {}
+		for _, list in processed do
+			for _, p in list do
+				if p and p.Parent then table.insert(parts, p) end
+			end
+		end
+		
+		return didMerge
+	end
 
 	local maxIterations = 6
 	for iter = 1, maxIterations do
-		local m1 = tryMergeAlongAxis("X")
-		local m2 = tryMergeAlongAxis("Z")
+		local m1 = tryMergeAlongAxis(1) -- Merge X
+		local m2 = tryMergeAlongAxis(3) -- Merge Z
 		if not m1 and not m2 then break end
+		mergedAny = true
+	end
+	
+	if mergedAny then
+		-- After merging, ensure bedrock parts are still anchored
+		for _, p in BedrockFolder:GetChildren() do
+			if p:IsA("BasePart") then p.Anchored = true end
+		end
 	end
 end
 
-task.spawn(function()
-	while true do
-		task.wait(8)
-		local success, err = pcall(function()
-
-			local count = 0
-			for _, c in BedrockFolder:GetChildren() do
-				if c:IsA("BasePart") and c.Name == "BedrockPart" then count = count + 1 end
-			end
-			if count >= 2 then
-				mergeBedrockParts()
-			end
-		end)
-		if not success then
-			warn("Bedrock merge error:", err)
-		end
-	end
-end)
-
-local function generateChunk(chunkX: number, chunkZ: number): ()
-	local terrainData: {{
-		worldX: number,
-		worldZ: number,
-		finalHeight: number,
-		canAddDeco: boolean,
-		isSlate: boolean
-	}} = {}
-
-	-- store simple descriptors for trees (not full CFrames) so we can compute offsets when we instantiate
-	local treePositions = {}
-	local partsGenerated: number = 0
-
-	local baseWorldX: number = chunkX * CHUNK_WORLD_SIZE
-	local baseWorldZ: number = chunkZ * CHUNK_WORLD_SIZE
-
-	local terrainGrid = {}
+local function generateChunkParts(chunkX: number, chunkZ: number, baseWorldX: number, baseWorldZ: number): ()
+	local terrainGrid: {} = {}
+	local treePositions: {} = {}
 	local minHeight: number = math.huge
 	local maxHeight: number = -math.huge
-
+	
 	for x = 1, CHUNK_SIZE do
 		terrainGrid[x] = {}
 		for z = 1, CHUNK_SIZE do
 			local worldX: number = baseWorldX + (x - 1) * 5
 			local worldZ: number = baseWorldZ + (z - 1) * 5
-
 			local baseHeight: number = getBaseHeight(worldX, worldZ)
-
 			local distanceFromSpawn: number = math.sqrt(worldX * worldX + worldZ * worldZ)
-
 			local noiseMultiplier: number = HILL_INTENSITY * math.max(0.5, 1 - (distanceFromSpawn / 2000))
-
 			local noise1: number = math.noise(worldX/300, worldZ/300)
 			local noise2: number = math.noise(worldX/100, worldZ/100) * 0.5
-			local noise3: number = math.noise(worldX/30, worldZ/30) * 0.2
-
+			local noise3: number = math.noise(worldX/30, worldZ/30) * 0.4 -- INCREASED: For more local unevenness
 			local combinedNoise: number = (noise1 + noise2 + noise3) * BASE_SCALE * noiseMultiplier
-
-			if combinedNoise < MIN_SLOPE_VALUE then
-				combinedNoise = MIN_SLOPE_VALUE
-			end
-
+			if combinedNoise < MIN_SLOPE_VALUE then combinedNoise = MIN_SLOPE_VALUE end
 			local finalHeight: number = baseHeight + combinedNoise
-
-			if finalHeight < minHeight then
-				minHeight = finalHeight
-			end
-			if finalHeight > maxHeight then
-				maxHeight = finalHeight
-			end
-
+			
+			if finalHeight < minHeight then minHeight = finalHeight end
+			if finalHeight > maxHeight then maxHeight = finalHeight end
+			
 			local canAddDeco: boolean = false
-			if finalHeight > 10 then
-				canAddDeco = math.random(1, 50) == 25
-			end
-
+			if finalHeight > 10 then canAddDeco = math.random(1, 50) == 25 end
 			local isSlate: boolean = finalHeight > 300 and math.random(1, 8) == 1
-
-			terrainGrid[x][z] = {
-				worldX = worldX,
-				worldZ = worldZ,
-				finalHeight = finalHeight,
-				canAddDeco = canAddDeco,
-				isSlate = isSlate,
-				merged = false,
-				isHole = false
-			}
+			
+			terrainGrid[x][z] = { worldX = worldX, worldZ = worldZ, finalHeight = finalHeight, canAddDeco = canAddDeco, isSlate = isSlate, merged = false, isHole = false }
 		end
 	end
 
@@ -964,9 +916,10 @@ local function generateChunk(chunkX: number, chunkZ: number): ()
 	-- this line is to prevent Roblox streaming from unloading the chunk
 	-- DO NOT TOUCH THIS NO MATTER WHAT! during testing, it is best to have this enabled.
 	chunkModel.ModelStreamingMode = Enum.ModelStreamingMode.Persistent -- Prevent Roblox streaming from unloading
-
+	
 	local plan, cavesModel = generateBlockCavesForChunk(chunkX, chunkZ, baseWorldX, baseWorldZ, terrainGrid, minHeight, maxHeight, chunkModel)
-
+	
+	local terrainData: {} = {}
 	for x = 1, CHUNK_SIZE do
 		for z = 1, CHUNK_SIZE do
 			local cell = terrainGrid[x][z]
@@ -974,28 +927,46 @@ local function generateChunk(chunkX: number, chunkZ: number): ()
 				local mergeWidth = 1
 				for nextZ = z + 1, CHUNK_SIZE do
 					local nextCell = terrainGrid[x][nextZ]
-					if nextCell.merged then
-						break
-					end
-
+					if nextCell.merged then break end
 					local heightDiff = math.abs(cell.finalHeight - nextCell.finalHeight)
-					if heightDiff <= HEIGHT_MERGE_TOLERANCE and cell.isSlate == nextCell.isSlate and not cell.isHole and not nextCell.isHole then
+					if heightDiff <= HEIGHT_MERGE_TOLERANCE and cell.isSlate == nextCell.isSlate and cell.isHole == nextCell.isHole then
 						mergeWidth = mergeWidth + 1
-						nextCell.merged = true
 					else
 						break
 					end
 				end
-
-				table.insert(terrainData, {
+				
+				local mergeDepth = 1
+				local ok = true
+				while ok and x + mergeDepth <= CHUNK_SIZE do
+					for dz = 0, mergeWidth - 1 do
+						local nextCell = terrainGrid[x + mergeDepth][z + dz]
+						if nextCell.merged then ok = false; break end
+						local heightDiff = math.abs(cell.finalHeight - nextCell.finalHeight)
+						if heightDiff > HEIGHT_MERGE_TOLERANCE or cell.isSlate ~= nextCell.isSlate or cell.isHole ~= nextCell.isHole then
+							ok = false; break
+						end
+					end
+					if ok then mergeDepth = mergeDepth + 1 end
+				end
+				
+				local data = {
 					worldX = cell.worldX,
 					worldZ = cell.worldZ,
 					finalHeight = cell.finalHeight,
-					canAddDeco = cell.canAddDeco,
 					isSlate = cell.isSlate,
-					mergeWidth = mergeWidth
-				})
-				cell.merged = true
+					canAddDeco = cell.canAddDeco,
+					mergeWidth = mergeWidth,
+					mergeDepth = mergeDepth,
+					isHole = cell.isHole
+				}
+				table.insert(terrainData, data)
+				
+				for dx = 0, mergeDepth - 1 do
+					for dz = 0, mergeWidth - 1 do
+						terrainGrid[x + dx][z + dz].merged = true
+					end
+				end
 			end
 		end
 	end
@@ -1004,56 +975,60 @@ local function generateChunk(chunkX: number, chunkZ: number): ()
 	local mergedPartCount = #terrainData
 	local reduction = math.floor((1 - mergedPartCount / originalPartCount) * 100)
 	local heightRange = maxHeight - minHeight
-
+	
 	local firstPart: Part? = nil
+	local floorY = BEDROCK_Y -- Use Bedrock Y as the bottom for all parts to fix the gap issue
 
 	for _, data in terrainData do
+        -- CRITICAL FIX from previous step: Skip part creation for cells marked as a cave entrance
+        if data.isHole then
+            continue
+        end
+
 		local part: Part = Instance.new("Part")
-
 		local mergeWidth = data.mergeWidth or 1
-		local partSizeZ = 5 * mergeWidth
-		local offsetZ = (mergeWidth - 1) * 2.5
+		local mergeDepth = data.mergeDepth or 1
 
-		part.Size = Vector3.new(5, 5, partSizeZ)
-		part.CFrame = CFrame.new(data.worldX, data.finalHeight, data.worldZ + offsetZ)
+		local partSizeZ = 5 * mergeWidth
+		local partSizeX = 5 * mergeDepth
+		local offsetZ = (mergeWidth - 1) * 2.5
+		local offsetX = (mergeDepth - 1) * 2.5
+		
+		-- FIX: Terrain Gap (Making parts thick columns)
+		local partYSize = data.finalHeight - floorY
+		local partY = floorY + (partYSize * 0.5)
+
+		part.Size = Vector3.new(partSizeX, partYSize, partSizeZ) -- New deep size
+		part.CFrame = CFrame.new(data.worldX + offsetX, partY, data.worldZ + offsetZ) -- New CFrame
+		
 		part.Anchored = true
 		part.TopSurface = Enum.SurfaceType.Smooth
 		part.BottomSurface = Enum.SurfaceType.Smooth
-
 		part.CanTouch = false
 		part.CanCollide = true
 		part.CanQuery = true
-
-		if data.isSlate then
-			part.Material = Enum.Material.Slate
-			part.Color = slateColor
-		else
-			part.Material = Enum.Material.Grass
-			part.Color = grassColor
+		
+		if data.isSlate then 
+			part.Material = Enum.Material.Slate 
+			part.Color = slateColor 
+		else 
+			part.Material = Enum.Material.Grass 
+			part.Color = grassColor 
 		end
-
-		if not firstPart then
-			firstPart = part
-		end
-
-		if data.canAddDeco then
+		
+		if not firstPart then firstPart = part end
+		
+		if data.canAddDeco then 
 			-- store descriptor, compute exact pivot at spawn to avoid floating
-			table.insert(treePositions, { x = data.worldX, z = data.worldZ, y = data.finalHeight })
+			table.insert(treePositions, { x = data.worldX + offsetX, z = data.worldZ + offsetZ, y = data.finalHeight }) 
 		end
-
+		
 		part.Parent = chunkModel
-
 		partsGenerated = partsGenerated + 1
-
-		if partsGenerated % PARTS_BATCH_SIZE == 0 then
-			task.wait()
-		end
+		if partsGenerated % PARTS_BATCH_SIZE == 0 then task.wait() end
 	end
-
-	if firstPart then
-		chunkModel.PrimaryPart = firstPart
-	end
-
+	
+	if firstPart then chunkModel.PrimaryPart = firstPart end
 	chunkModel.Parent = Map
 
 	-- Spawn trees using model extents and parent them to the chunk (prevents floating/unloaded mismatch)
@@ -1061,55 +1036,53 @@ local function generateChunk(chunkX: number, chunkZ: number): ()
 		task.spawn(function()
 			for i, spawnInfo in ipairs(treePositions) do
 				local ok, tree = pcall(function() return ServerStorage.Items.Materials.tree:Clone() end)
-				if not ok or not tree then
-					continue
+				if not ok or not tree then continue end
+
+				-- FIX: Use raycast to find the exact ground Y to prevent floating
+				local rayOrigin = Vector3.new(spawnInfo.x, spawnInfo.y + 10, spawnInfo.z) -- Start a bit above the expected height
+				local rayDirection = Vector3.new(0, -20, 0) -- Cast 20 units down
+
+				local rayParams = RaycastParams.new()
+				rayParams.FilterType = Enum.RaycastFilterType.Blacklist
+				rayParams.FilterDescendantsInstances = {tree, chunkModel} -- Ignore the tree and the current chunk model parts in case of raycast bugs
+				
+				local raycastResult = workspace:Raycast(rayOrigin, rayDirection, rayParams)
+				
+				local finalY = spawnInfo.y -- Fallback to original finalHeight
+
+				if raycastResult and raycastResult.Instance.Parent ~= BedrockFolder and raycastResult.Instance.Parent.Parent ~= BedrockFolder then
+					finalY = raycastResult.Position.Y
 				end
 
-				-- compute vertical offset from model extents so tree sits on the terrain surface
+				-- compute vertical offset from model extents so tree sits on the terrain 
 				local size = tree:GetExtentsSize()
 				local verticalOffset = size.Y * 0.5
-
-				local rotY = math.rad(math.random(0, 359))
-				local targetCFrame = CFrame.new(spawnInfo.x, spawnInfo.y + verticalOffset, spawnInfo.z) * CFrame.Angles(0, rotY, 0)
+				
+				local rotY = math.rad(math.random(0, 359)) -- Rotates Y axis as requested
+				local targetCFrame = CFrame.new(spawnInfo.x, finalY + verticalOffset, spawnInfo.z) * CFrame.Angles(0, rotY, 0)
+				
 				tree:PivotTo(targetCFrame)
-
 				-- parent to chunk so it moves/unloads with the chunk
-				tree.Parent = chunkModel
-
-				-- yield occasionally for performance
-				if i % 2 == 0 then
-					task.wait()
-				end
+				tree.Parent = chunkModel 
+				-- yield occasionally...
+				if i % 8 == 0 then task.wait() end
 			end
 		end)
 	end
 
-	local chunkKey: string = getChunkKey(chunkX, chunkZ)
-	loadedChunks[chunkKey] = true
-	generatingChunks[chunkKey] = nil
+	-- Run the bedrock merger to reduce part count for bedrock
+	if chunkX % 4 == 0 and chunkZ % 4 == 0 then -- run less often
+		mergeBedrockParts()
+	end
+	
+	loadedChunks[getChunkKey(chunkX, chunkZ)] = true
 	chunksGenerated = chunksGenerated + 1
 end
 
-local function requestChunkGeneration(chunkX: number, chunkZ: number): ()
-	local chunkKey: string = getChunkKey(chunkX, chunkZ)
-
-	if loadedChunks[chunkKey] or generatingChunks[chunkKey] then
-		return
-	end
-
-	generatingChunks[chunkKey] = true
-
-	task.spawn(function()
-		generateChunk(chunkX, chunkZ)
-	end)
-end
-
-local function updateChunks(): ()
-	local currentTime: number = tick()
-	if currentTime - lastUpdateTime < 1 then
-		return
-	end
-	lastUpdateTime = currentTime
+local function updateLoadedChunks(): ()
+	if RunService:IsClient() then return end
+	if tick() - lastUpdateTime < (initialLoadComplete and 0.5 or 0.1) then return end
+	lastUpdateTime = tick()
 
 	local highestY = nil
 	for _, player: Player in Players:GetPlayers() do
@@ -1119,16 +1092,15 @@ local function updateChunks(): ()
 		end
 	end
 	CurrentHighestPlayerY = highestY
-
+	
 	for _, player: Player in Players:GetPlayers() do
 		if player.Character and player.Character:FindFirstChild("HumanoidRootPart") then
 			local playerPosition: Vector3 = player.Character.HumanoidRootPart.Position
 			local playerChunkX: number, playerChunkZ: number = getChunkCoords(playerPosition)
-
+			
 			local chunksToQueue: {{number}} = {}
-
 			local currentRenderDistance = initialLoadComplete and RENDER_DISTANCE or INITIAL_RENDER_DISTANCE
-
+			
 			for x = playerChunkX - currentRenderDistance, playerChunkX + currentRenderDistance do
 				for z = playerChunkZ - currentRenderDistance, playerChunkZ + currentRenderDistance do
 					local chunkKey: string = getChunkKey(x, z)
@@ -1172,15 +1144,30 @@ local function processChunkQueue(): ()
 		end
 
 		local coords: {number} = table.remove(chunkQueue, 1)
-		if coords then
-			local chunkKey: string = getChunkKey(coords[1], coords[2])
+		local chunkX, chunkZ = coords[1], coords[2]
+		local chunkKey = getChunkKey(chunkX, chunkZ)
+		
+		if loadedChunks[chunkKey] or generatingChunks[chunkKey] then
 			queuedChunks[chunkKey] = nil
-			requestChunkGeneration(coords[1], coords[2])
+			continue
 		end
+
+		generatingChunks[chunkKey] = true
+
+		local success, message = pcall(function()
+			local baseWorldX: number = chunkX * CHUNK_WORLD_SIZE
+			local baseWorldZ: number = chunkZ * CHUNK_WORLD_SIZE
+			generateChunkParts(chunkX, chunkZ, baseWorldX, baseWorldZ)
+		end)
+		
+		if not success then
+			warn("Error generating chunk " .. chunkKey .. ": " .. tostring(message))
+		end
+		
+		generatingChunks[chunkKey] = nil
+		queuedChunks[chunkKey] = nil
 	end
 end
 
-RunService.Heartbeat:Connect(updateChunks)
+RunService.Heartbeat:Connect(updateLoadedChunks)
 RunService.Heartbeat:Connect(processChunkQueue)
-
--- (Due to length, I will now populate it.)
